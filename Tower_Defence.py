@@ -22,6 +22,8 @@ from UpgradeTree import (
     GlobalUpgrades, UPGRADE_TREE, BRANCH_META,
     UPGRADE_POINTS_PER_WIN,
 )
+from SaveManager import save_game, load_game, delete_save, save_exists
+from Story import CutsceneManager
 
 # ---------------------------------------------------------------------------
 # Level definitions
@@ -185,11 +187,33 @@ class Game:
 
         # ---- Persistent session state ----
         self.upgrades = GlobalUpgrades()
-        self.unlocked_levels: set[int] = {1}   # only level 1 starts open
+        self.unlocked_levels: set[int] = {1}
+        self._completed_levels: set[int] = set()   # levels finished at least once
+
+        # Auto-load save if one exists
+        loaded = load_game(self.upgrades)
+        if loaded is not None:
+            self.unlocked_levels    = loaded["unlocked"]
+            self._completed_levels  = loaded["completed"]
+            self._save_status_msg: str = "Wczytano zapis"
+        else:
+            self._save_status_msg: str = ""
+        self._save_status_timer: int = 0
 
         self.state: str = "MENU"
         self.selected_tower_type: str | None = "basic"
         self.selected_tower_obj: Tower | None = None
+
+        # Sell system — towers refund this fraction of their total invested cost
+        self._SELL_FRACTION: float = 0.60
+
+        # Cutscene manager
+        self._cutscene = CutsceneManager(
+            self.screen,
+            {"big": self.font_big, "med": self.font_med,
+             "small": self.font_small, "tiny": self.font_tiny},
+        )
+        self._post_cutscene_pending: bool = False  # show post scene after victory
 
         # ---- Runtime (initialised in start_level) ----
         self.current_level_id: int = 1
@@ -240,7 +264,10 @@ class Game:
         self.abilities.set_cooldown_reduction(gu.cooldown_reduction)
 
         self._precompute_valid_positions()
-        self.state = "PLAYING"
+        # Show pre-level cutscene first
+        self._cutscene.load("pre", level_id)
+        self._post_cutscene_pending = False
+        self.state = "CUTSCENE_PRE"
 
     # ==================================================================
     # Per-frame update (PLAYING state)
@@ -505,6 +532,25 @@ class Game:
             self.font_small.render("[U] DRZEWO ULEPSZEŃ", True, ub_col),
             (sx + 25, 87),
         )
+
+        # New Game button
+        ng_col = (180, 60, 60)
+        pygame.draw.rect(self.screen, (15, 18, 15), (sx + 15, 118, 210, 30))
+        pygame.draw.rect(self.screen, ng_col,       (sx + 15, 118, 210, 30), 1)
+        self.screen.blit(
+            self.font_small.render("[N] NOWA GRA", True, ng_col),
+            (sx + 25, 126),
+        )
+
+        # Save status toast (fades after ~2 s)
+        if self._save_status_timer > 0:
+            self._save_status_timer -= 1
+            alpha = min(255, self._save_status_timer * 4)
+            toast = self.font_small.render(
+                f"💾  {self._save_status_msg}", True, (100, 230, 130)
+            )
+            toast_x = GAME_WIDTH // 2 - toast.get_width() // 2
+            self.screen.blit(toast, (toast_x, 90))
 
         pygame.draw.line(self.screen, (30, 40, 30),
                          (sx + 10, 120), (sx + UI_WIDTH - 10, 120), 1)
@@ -808,14 +854,27 @@ class Game:
         else:
             self._draw_shop_panel(sx)
 
-        # Victory check (once only)
+        # Victory check (once only per session)
         if not self._victory_processed and self.wave_mgr.all_waves_done and not self.enemies:
             self.victory = True
             self._victory_processed = True
-            self.upgrades.points += UPGRADE_POINTS_PER_WIN
+
+            # Award points only if this level hasn't been completed before
+            first_time = self.current_level_id not in self._completed_levels
+            if first_time:
+                self.upgrades.points += UPGRADE_POINTS_PER_WIN
+                self._completed_levels.add(self.current_level_id)
+
             next_lvl = self.current_level_id + 1
             if next_lvl in LEVELS:
                 self.unlocked_levels.add(next_lvl)
+            save_game(self.unlocked_levels, self.upgrades, self._completed_levels)
+            self._save_status_msg   = "Postęp zapisany"
+            self._save_status_timer = 180
+            # Show post-level cutscene
+            self._cutscene.load("post", self.current_level_id)
+            self._post_cutscene_pending = True
+            self.state = "CUTSCENE_POST"
 
     def _draw_tower_panel(self, sx: int) -> None:
         t = self.selected_tower_obj
@@ -841,6 +900,16 @@ class Game:
         desel_y = y0 + 210
         pygame.draw.rect(self.screen, (255, 50, 50), (sx + 20, desel_y, 200, 32), 1)
         self.screen.blit(self.font_small.render("ODZNACZ WIEŻĘ", True, (255, 50, 50)), (sx + 50, desel_y + 8))
+
+        # Sell button
+        invested = getattr(t, "invested_cost", TOWER_TYPES[t.type]["cost"])
+        refund   = int(invested * self._SELL_FRACTION)
+        sell_y   = desel_y + 40
+        pygame.draw.rect(self.screen, (180, 100, 20), (sx + 20, sell_y, 200, 32), 1)
+        self.screen.blit(
+            self.font_small.render(f"SPRZEDAJ (+${refund})", True, (220, 140, 40)),
+            (sx + 35, sell_y + 8),
+        )
 
     def _draw_shop_panel(self, sx: int) -> None:
         self.screen.blit(self.font_small.render("SKLEP:", True, (150, 150, 150)), (sx + 20, _SHOP_START_Y))
@@ -887,10 +956,14 @@ class Game:
     # ==================================================================
 
     def _handle_menu_click(self, mx: int, my: int) -> None:
-        # Upgrade tree button
         sx = GAME_WIDTH
-        if sx + 20 < mx < sx + 220 and 90 < my < 126:
+        # Upgrade tree button
+        if sx + 15 < mx < sx + 225 and 78 < my < 112:
             self.state = "UPGRADES"
+            return
+        # New Game button
+        if sx + 15 < mx < sx + 225 and 118 < my < 148:
+            self._new_game()
             return
         # Level node
         for lid, data in LEVELS.items():
@@ -901,6 +974,17 @@ class Game:
     def _handle_menu_keydown(self, key: int) -> None:
         if key == pygame.K_u:
             self.state = "UPGRADES"
+        elif key == pygame.K_n:
+            self._new_game()
+
+    def _new_game(self) -> None:
+        """Reset all progress and delete the save file."""
+        delete_save()
+        self.upgrades           = GlobalUpgrades()
+        self.unlocked_levels    = {1}
+        self._completed_levels  = set()
+        self._save_status_msg   = "Nowa gra rozpoczęta"
+        self._save_status_timer = 180
 
     def _handle_upgrades_click(self, mx: int, my: int) -> None:
         for key, node in UPGRADE_TREE.items():
@@ -916,7 +1000,6 @@ class Game:
             elif key == pygame.K_u:
                 self.state = "UPGRADES"
             return
-
         if self.game_over:
             if key == pygame.K_r:
                 self.start_level(self.current_level_id)
@@ -983,11 +1066,11 @@ class Game:
             if self.selected_tower_type:
                 cost = TOWER_TYPES[self.selected_tower_type]["cost"]
                 if self._is_position_valid(mx, my) and self.money >= cost:
-                    # Apply global damage & fire rate bonuses to new towers
                     t = Tower(mx, my, self.selected_tower_type)
                     gu = self.upgrades
                     t.damage    *= (1.0 + gu.tower_damage_mult_bonus)
                     t.fire_rate  = max(1, int(t.fire_rate * (1.0 - gu.fire_rate_reduction)))
+                    t.invested_cost = cost   # track for sell refund
                     self.towers.append(t)
                     self.money -= cost
 
@@ -1016,6 +1099,7 @@ class Game:
         if t.level < 3 and sx + 20 <= mx <= sx + 220 and y0 + 74 <= my <= y0 + 112:
             if self.money >= u_cost and t.level < self.current_level_id + 1:
                 self.money -= u_cost
+                t.invested_cost = getattr(t, "invested_cost", TOWER_TYPES[t.type]["cost"]) + u_cost
                 t.upgrade()
         elif t.level == 3:
             for i, branch in enumerate(["A", "B", "C"]):
@@ -1023,10 +1107,20 @@ class Game:
                 if sx + 20 <= mx <= sx + 220 and y <= my <= y + 36:
                     if self.money >= 200:
                         self.money -= 200
+                        t.invested_cost = getattr(t, "invested_cost", TOWER_TYPES[t.type]["cost"]) + 200
                         t.upgrade(branch)
 
         desel_y = y0 + 210
         if sx + 20 <= mx <= sx + 220 and desel_y <= my <= desel_y + 32:
+            self.selected_tower_obj = None
+
+        # Sell button
+        sell_y = desel_y + 40
+        if sx + 20 <= mx <= sx + 220 and sell_y <= my <= sell_y + 32:
+            invested = getattr(t, "invested_cost", TOWER_TYPES[t.type]["cost"])
+            refund   = int(invested * self._SELL_FRACTION)
+            self.money += refund
+            self.towers.remove(t)
             self.selected_tower_obj = None
 
     def _handle_shop_click(self, mx: int, my: int, sx: int) -> None:
@@ -1112,6 +1206,7 @@ class Game:
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    save_game(self.unlocked_levels, self.upgrades, self._completed_levels)
                     pygame.quit()
                     sys.exit()
 
@@ -1123,9 +1218,20 @@ class Game:
 
                 elif self.state == "UPGRADES":
                     if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        save_game(self.unlocked_levels, self.upgrades, self._completed_levels)
+                        self._save_status_msg   = "Postęp zapisany"
+                        self._save_status_timer = 120
                         self.state = "MENU"
                     if event.type == pygame.MOUSEBUTTONDOWN:
                         self._handle_upgrades_click(mx, my)
+
+                elif self.state in ("CUTSCENE_PRE", "CUTSCENE_POST"):
+                    done = self._cutscene.update([event])
+                    if done:
+                        if self.state == "CUTSCENE_PRE":
+                            self.state = "PLAYING"
+                        else:
+                            self.state = "PLAYING"   # returns to victory overlay
 
                 elif self.state == "PLAYING":
                     if event.type == pygame.KEYDOWN:
@@ -1137,6 +1243,13 @@ class Game:
                 self._draw_menu()
             elif self.state == "UPGRADES":
                 self._draw_upgrades()
+            elif self.state in ("CUTSCENE_PRE", "CUTSCENE_POST"):
+                # Dark background for both — post cutscene does NOT render
+                # the game underneath because _draw_playing calls
+                # _draw_end_overlay (victory=True) which would overlap the scene.
+                self.screen.fill((8, 10, 14))
+                self._cutscene.draw()
+                pygame.display.update()
             else:
                 self._update_playing()
                 self._draw_playing()
